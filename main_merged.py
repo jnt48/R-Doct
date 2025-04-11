@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from pydantic import BaseModel
 from typing import Dict, List, Any, Optional
 import statistics
@@ -7,21 +7,28 @@ import os
 from datetime import datetime
 import google.generativeai as genai
 from fastapi.middleware.cors import CORSMiddleware
+import base64
+import io
+from PIL import Image
+from dotenv import load_dotenv
 
-app = FastAPI()
+# Load environment variables
+load_dotenv()
+
+app = FastAPI(title="Document Management and Analysis API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[""],
+    allow_origins=["http://localhost:3000"],  # Add your frontend URL here
     allow_credentials=True,
-    allow_methods=[""],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
 )
 
 # Configure Google Generative AI with your API key
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
-    print("WARNING: GOOGLE_API_KEY environment variable not set. Gemini analysis will not work.")
+    print("WARNING: GOOGLE_API_KEY environment variable not set. Gemini functionality will not work.")
 
 # Configure the Gemini model
 try:
@@ -31,6 +38,7 @@ except Exception as e:
     print(f"Error configuring Gemini model: {e}")
     model = None
 
+# Data Models
 class CollectionsData(BaseModel):
     collections: Dict[str, List[Dict[str, Any]]]
 
@@ -42,55 +50,33 @@ class AnalysisResult(BaseModel):
     dataDistribution: Dict[str, Any] = {}
     fieldFrequencyAnalysis: Dict[str, Any] = {}
 
-    
-
-@app.post("/analyze", response_model=AnalysisResult)
-async def analyze_collections(data: CollectionsData):
+# Image Processing Functions
+def input_image_setup(file_bytes: bytes) -> dict:
     try:
-        collections = data.collections
-        
-        # Calculate basic statistics
-        collection_counts = {name: len(docs) for name, docs in collections.items()}
-        total_documents = sum(collection_counts.values())
-        
-        if total_documents == 0:
-            raise HTTPException(status_code=400, detail="No documents found in collections")
-        
-        # Add field frequency analysis
-        field_analysis = analyze_field_frequency(collections)
-        
-        # Add data distribution analysis
-        data_distribution = analyze_data_distribution(collections)
-        
-        # Use Gemini for advanced analysis if available
-        if model and GOOGLE_API_KEY:
-            results = await analyze_with_gemini(collections, collection_counts, total_documents, field_analysis)
-            
-            # Add our additional analyses
-            results.fieldFrequencyAnalysis = field_analysis
-            results.dataDistribution = data_distribution
-            results.collectionSpecificInsights = generate_collection_specific_insights(collections)
-            
-            return results
-        else:
-            # Fallback to basic analysis if Gemini is not available
-            insights = generate_basic_insights(collections, collection_counts, total_documents)
-            quality_metrics = calculate_basic_quality_metrics(collections)
-            recommendations = generate_basic_recommendations(collections, quality_metrics)
-            collection_specific_insights = generate_collection_specific_insights(collections)
-            
-            return AnalysisResult(
-                insights=insights,
-                qualityMetrics=quality_metrics,
-                recommendations=recommendations,
-                collectionSpecificInsights=collection_specific_insights,
-                fieldFrequencyAnalysis=field_analysis,
-                dataDistribution=data_distribution
-            )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
+        image = Image.open(io.BytesIO(file_bytes))
 
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format="JPEG")
+        img_bytes = img_byte_arr.getvalue()
+
+        image_data = {
+            "mime_type": "image/jpeg",
+            "data": base64.b64encode(img_bytes).decode()
+        }
+        return image_data
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error processing image: {e}")
+
+def get_gemini_response(prompt: str, image_content: dict) -> str:
+    if not model:
+        raise HTTPException(status_code=500, detail="Gemini model not configured")
+    
+    response = model.generate_content([prompt, image_content])
+    return response.text
+
+# Document Collection Analysis Functions
 def analyze_field_frequency(collections):
     """Analyze field frequency across collections"""
     field_analysis = {}
@@ -157,9 +143,10 @@ def analyze_data_distribution(collections):
     distribution["totalDocuments"] = total_docs
     
     # Calculate percentages for collection breakdown
-    for collection_name in distribution["collectionBreakdown"]:
-        count = distribution["collectionBreakdown"][collection_name]["count"]
-        distribution["collectionBreakdown"][collection_name]["percentage"] = round((count / total_docs) * 100, 1)
+    if total_docs > 0:
+        for collection_name in distribution["collectionBreakdown"]:
+            count = distribution["collectionBreakdown"][collection_name]["count"]
+            distribution["collectionBreakdown"][collection_name]["percentage"] = round((count / total_docs) * 100, 1)
     
     # Sort date distribution by date
     sorted_dates = sorted(date_counts.items())
@@ -517,6 +504,82 @@ def generate_basic_recommendations(collections, quality_metrics):
     
     return recommendations
 
+# API Endpoints for Collection Analysis
+@app.post("/analyze", response_model=AnalysisResult)
+async def analyze_collections(data: CollectionsData):
+    try:
+        collections = data.collections
+        
+        # Calculate basic statistics
+        collection_counts = {name: len(docs) for name, docs in collections.items()}
+        total_documents = sum(collection_counts.values())
+        
+        if total_documents == 0:
+            raise HTTPException(status_code=400, detail="No documents found in collections")
+        
+        # Add field frequency analysis
+        field_analysis = analyze_field_frequency(collections)
+        
+        # Add data distribution analysis
+        data_distribution = analyze_data_distribution(collections)
+        
+        # Use Gemini for advanced analysis if available
+        if model and GOOGLE_API_KEY:
+            results = await analyze_with_gemini(collections, collection_counts, total_documents, field_analysis)
+            
+            # Add our additional analyses
+            results.fieldFrequencyAnalysis = field_analysis
+            results.dataDistribution = data_distribution
+            results.collectionSpecificInsights = generate_collection_specific_insights(collections)
+            
+            return results
+        else:
+            # Fallback to basic analysis if Gemini is not available
+            insights = generate_basic_insights(collections, collection_counts, total_documents)
+            quality_metrics = calculate_basic_quality_metrics(collections)
+            recommendations = generate_basic_recommendations(collections, quality_metrics)
+            collection_specific_insights = generate_collection_specific_insights(collections)
+            
+            return AnalysisResult(
+                insights=insights,
+                qualityMetrics=quality_metrics,
+                recommendations=recommendations,
+                collectionSpecificInsights=collection_specific_insights,
+                fieldFrequencyAnalysis=field_analysis,
+                dataDistribution=data_distribution
+            )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis error: {str(e)}")
+
+# API Endpoints for Document Extraction
+@app.post("/extract")
+async def extract_data(
+    file: UploadFile = File(...),
+    instructions: str = Form("")
+):
+    if not file:
+        raise HTTPException(status_code=400, detail="No file uploaded.")
+
+    try:
+        file_bytes = await file.read()
+        image_content = input_image_setup(file_bytes)
+
+        extraction_prompt = (
+            "You are an expert document data extractor. Analyze the provided image of a document of any type "
+            "(e.g., form, invoice, letter, etc.) and identify all relevant fields and information. "
+            "Return only the extracted data in a valid JSON format with descriptive keys and no additional text or markdown formatting. "
+            "Do not include any triple backticks or code fences. Include no \\n in the code"
+        )
+        if instructions.strip():
+            extraction_prompt += "\nAdditional instructions: " + instructions.strip()
+
+        extracted_data = get_gemini_response(extraction_prompt, image_content)
+        return {"extracted_data": extracted_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Legacy API Endpoints (maintained for backward compatibility)
 @app.get("/collections")
 async def get_collections():
     """Return a list of collections from the database - maintained for backward compatibility"""
@@ -566,3 +629,7 @@ async def get_collection(collection_id: str):
             }
         ]
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
